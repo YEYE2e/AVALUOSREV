@@ -6,3 +6,8 @@ dist/
 data/
 *.pyc
 .env
+.atl/
+.astro/
+.playwright-cli/
+*.egg-info/
+omp-session-*.html
