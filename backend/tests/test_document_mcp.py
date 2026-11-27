@@ -13,7 +13,7 @@ pytest.importorskip("mcp", reason="Instalar el extra documents para probar MCP")
 from docx import Document
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from pypdf import PdfWriter
 
@@ -33,7 +33,11 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
     sheet.append(["omitido", "omitido", "omitido"])
     sheet.row_dimensions[2].hidden = True
     sheet.column_dimensions["A"].hidden = True
+    # Add a far cell beyond A1:L32 to prove unlimited-size search & dependency tracing
+    sheet["U126"] = "=C1*2"
+    sheet["T126"] = "Valor proyectado"
     book.create_sheet("Aux").sheet_state = "hidden"
+    book["Aux"]["A1"] = "#REF!"
     excel_file = tmp_path / "fixture.xlsx"
     book.save(excel_file)
     original = workspace.save_original(case, xlsx, excel_file.read_bytes())
@@ -53,9 +57,11 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
     workspace.save_original(case, pdf, pdf_file.read_bytes())
 
     def parameters(mode):
-        return StdioServerParameters(command=sys.executable, cwd=Path(__file__).resolve().parents[1],
-                                     args=["-m", "app.document_mcp", "--root", str(tmp_path),
-                                           "--case", str(case), "--mode", mode])
+        return StdioServerParameters(
+            command=sys.executable,
+            cwd=Path(__file__).resolve().parents[1],
+            args=["-m", "app.document_mcp", "--root", str(tmp_path), "--case", str(case), "--mode", mode],
+        )
 
     async def exercise():
         async with stdio_client(parameters("read")) as (read, write):
@@ -63,6 +69,7 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
                 await client.initialize()
                 tools = {tool.name for tool in (await client.list_tools()).tools}
                 assert "crear_informe" not in tools
+                assert {"inventario", "resumen_expediente", "buscar_excel", "rastrear_celda_excel", "buscar_pdf", "buscar_docx", "ver_pagina_pdf", "ver_imagen"} <= tools
 
                 async def call(tool, **args):
                     result = await client.call_tool(tool, args)
@@ -73,14 +80,30 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
                 assert {d["document_id"] for d in inventory["documents"]} == set(map(str, [xlsx, docx, pdf]))
                 denied = await client.call_tool("hojas_excel", {"document_id": str(foreign)})
                 assert denied.isError
-                hidden = await client.call_tool("leer_rango_excel", {"document_id": str(xlsx),
-                                                "hoja": "Aux", "rango": "A1"})
+                hidden = await client.call_tool("leer_rango_excel", {"document_id": str(xlsx), "hoja": "Aux", "rango": "A1"})
                 assert hidden.isError
+
                 rng = await call("leer_rango_excel", document_id=str(xlsx), hoja="Mercado", rango="A1:C2")
                 assert [c["cell"] for c in rng["cells"]] == ["B1", "C1"]
                 assert rng["cells"][1]["formula"] == "=A1/B1" and rng["cells"][1]["cached_value"] is None
+
+                # Search far beyond A1:L32
+                found = await call("buscar_excel", document_id=str(xlsx), consulta="Valor proyectado")
+                assert found["count"] == 1 and found["matches"][0]["cell"] == "T126"
+
+                # Trace precedents (including hidden A1!) and visible dependents (U126!)
+                trace = await call("rastrear_celda_excel", document_id=str(xlsx), hoja="Mercado", celda="C1")
+                assert any(p["cell"] == "A1" and p["hidden"] is True for p in trace["precedents"])
+                assert any(d["cell"] == "U126" for d in trace["visible_dependents"])
+
+                atlas = await call("resumen_expediente")
+                assert len(atlas["documents"]) == 3
+
                 table = await call("leer_bloque_docx", document_id=str(docx), bloque=2, fila=1)
                 assert table["text"] == "300 m2"
+                docx_search = await call("buscar_docx", document_id=str(docx), consulta="300 m2")
+                assert docx_search["count"] == 1
+
                 page = await call("leer_pagina_pdf", document_id=str(pdf), pagina=1)
                 assert not page["searchable_text"]
 
@@ -88,24 +111,35 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
             async with ClientSession(read, write) as client:
                 await client.initialize()
                 assert {tool.name for tool in (await client.list_tools()).tools} == {"crear_informe", "marcar_excel"}
-                finding = {"sheet": "Mercado", "cell": "C1", "location": "Mercado!C1",
-                           "evidence": "Mercado!B1", "observation": "Revisar área",
-                           "recommendation": "Cotejar el área", "status": "requiere_verificacion"}
-                denied = await client.call_tool("marcar_excel", {"document_id": str(xlsx),
-                                                "hallazgos": [{**finding, "cell": "A1"}]})
+                finding = {
+                    "sheet": "Mercado",
+                    "cell": "C1",
+                    "location": "Mercado!C1",
+                    "evidence": "Mercado!B1",
+                    "observation": "Revisar área",
+                    "recommendation": "Cotejar el área",
+                    "status": "sustentado",
+                    "severity": "critico",
+                    "review_type": "Cálculo / fórmula",
+                    "value_impact": "demostrado",
+                }
+                denied = await client.call_tool("marcar_excel", {"document_id": str(xlsx), "hallazgos": [{**finding, "cell": "A1"}]})
                 assert denied.isError
-                marked = await client.call_tool("marcar_excel", {"document_id": str(xlsx),
-                                                "hallazgos": [finding]})
+                marked = await client.call_tool("marcar_excel", {"document_id": str(xlsx), "hallazgos": [finding]})
                 assert not marked.isError, marked.content
                 marked_id = json.loads(marked.content[0].text)["report_id"]
-                result = await client.call_tool("crear_informe", {"hallazgos": [{
-                    "location": "Mercado!C1", "evidence": "Mercado!B1", "observation": "Revisar área",
-                    "recommendation": "Cotejar el área", "status": "requiere_verificacion"}]})
+                result = await client.call_tool(
+                    "crear_informe",
+                    {
+                        "hallazgos": [{k: v for k, v in finding.items() if k not in ("sheet", "cell")}],
+                        "resumen": "Resumen técnico",
+                        "verified_independently": True,
+                    },
+                )
                 assert not result.isError, result.content
                 return json.loads(result.content[0].text)["report_id"], marked_id
 
     report_id, marked_id = asyncio.run(exercise())
-    from openpyxl import load_workbook
     marked = load_workbook(tmp_path / str(case) / "reports" / f"{marked_id}.xlsx")
     cell = marked["Mercado"]["C1"]
     assert cell.value == "=A1/B1"
@@ -121,17 +155,41 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
         if not comments:
             comments = [cell.comment.text] if cell.comment else []
             assert any(
-                node.findtext("{*}Row") == "0" and node.findtext("{*}Column") == "2"
+                node.findtext("{*}Row") == "0"
+                and node.findtext("{*}Column") == "2"
                 and node.find("{*}Visible") is not None
-                for part in archive.namelist() if part.endswith(".vml")
+                for part in archive.namelist()
+                if part.endswith(".vml")
                 for node in ElementTree.fromstring(archive.read(part)).iterfind(".//{*}ClientData")
             )
-    assert any(message and all(text in message for text in (
-        "Nota original del revisor.", "Revisar área", "Mercado!B1", "Cotejar el área",
-    )) for message in comments)
+    assert any(
+        message and all(text in message for text in ("Nota original del revisor.", "Revisar área", "Mercado!B1", "Cotejar el área"))
+        for message in comments
+    )
     assert marked.active.title == "REVISIÓN TÉCNICA"
-    assert marked["REVISIÓN TÉCNICA"]["G6"].hyperlink.location == "'Mercado'!C1"
-    assert marked["REVISIÓN TÉCNICA"]["C6"].value == "Revisar área"
+    review_sheet = marked["REVISIÓN TÉCNICA"]
+    assert review_sheet["A1"].value == "REVISIÓN TÉCNICA DE AVALÚO — OBSERVACIONES PARA VALIDACIÓN DEL PERITO"
+    assert "(Críticas: 1 |" in review_sheet["A2"].value
+    assert [review_sheet.cell(5, col).value for col in range(1, 17)] == [
+        "N.º",
+        "Importancia",
+        "Tipo de revisión",
+        "Hoja",
+        "Celda",
+        "Dato revisado",
+        "Hallazgo",
+        "Explicación técnica",
+        "Valor actual",
+        "Valor referencia",
+        "Diferencia",
+        "Corrección recomendada",
+        "Incidencia en valor",
+        "Estado",
+        "Evidencias",
+        "Ubicación",
+    ]
+    assert review_sheet["P6"].hyperlink.location == "'Mercado'!C1"
+    assert review_sheet["G6"].value == "Revisar área"
     report = Document(tmp_path / str(case) / "reports" / f"{report_id}.docx")
-    assert any(p.text == "Observación: Revisar área" for p in report.paragraphs)
+    assert any("Revisar área" in p.text for p in report.paragraphs)
     assert original.read_bytes() == excel_file.read_bytes()
