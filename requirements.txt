@@ -1,0 +1,3 @@
+# Fuente única de dependencias Python: backend/pyproject.toml
+# Permite instalar con `pip install -r requirements.txt` sin duplicar versiones.
+-e ./backend[dev,documents]

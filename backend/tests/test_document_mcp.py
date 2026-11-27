@@ -193,3 +193,141 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
     report = Document(tmp_path / str(case) / "reports" / f"{report_id}.docx")
     assert any("Revisar área" in p.text for p in report.paragraphs)
     assert original.read_bytes() == excel_file.read_bytes()
+
+
+def test_cross_platform_openpyxl_excel_exporter_invariants(tmp_path, monkeypatch):
+    from app.document_mcp import ExcelFinding, export_marked_excel, export_marked_excel_openpyxl
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "1 DATOS"
+    sheet["A1"] = "oculto"
+    sheet["B1"] = 100
+    sheet["C1"] = "=B1*2"
+    sheet["C1"].comment = Comment("Nota original del perito.", "Perito")
+    sheet["D1"] = "Predio urbano"
+    sheet.merge_cells("D1:E1")
+    sheet.column_dimensions["A"].hidden = True
+    book.create_sheet("Oculta").sheet_state = "hidden"
+    book["Oculta"]["A1"] = 123
+
+    source = tmp_path / "avaluo.xlsx"
+    book.save(source)
+    before_bytes = source.read_bytes()
+
+    f_hidden = ExcelFinding(
+        sheet="1 DATOS",
+        cell="A1",
+        location="1 DATOS!A1",
+        evidence="1 DATOS!A1",
+        observation="Celda oculta",
+        recommendation="No marcar ocultas",
+        status="sustentado",
+        severity="critico",
+    )
+    with pytest.raises(ValueError):
+        export_marked_excel_openpyxl(source, tmp_path / "fail_hidden.xlsx", [f_hidden])
+
+    f1 = ExcelFinding(
+        sheet="1 DATOS",
+        cell="C1",
+        location="1 DATOS!C1",
+        evidence="1 DATOS!B1 = 100",
+        observation="Fórmula con factor duplicado",
+        recommendation="Revisar multiplicador",
+        status="sustentado",
+        severity="critico",
+        review_type="Cálculo / fórmula",
+        value_impact="demostrado",
+    )
+    f2 = ExcelFinding(
+        sheet="1 DATOS",
+        cell="C1",
+        location="1 DATOS!C1",
+        evidence="Certificado catastral",
+        observation="Segunda observación consolidada",
+        recommendation="Validar con respaldo",
+        status="requiere_verificacion",
+        severity="importante",
+    )
+    f_merged = ExcelFinding(
+        sheet="1 DATOS",
+        cell="E1",
+        location="1 DATOS!E1",
+        evidence="Escritura pág. 2",
+        observation="Clasificación difiere de escritura",
+        recommendation="Ajustar tipo de inmueble",
+        status="sustentado",
+        severity="menor",
+    )
+
+    monkeypatch.setenv("AVALUOS_EXCEL_ENGINE", "openpyxl")
+    destination = tmp_path / "marcado.xlsx"
+    engine = export_marked_excel(source, destination, [f1, f2, f_merged])
+    assert engine == "openpyxl"
+    assert source.read_bytes() == before_bytes
+
+    marked = load_workbook(destination, data_only=False)
+    assert marked.active.title == "REVISIÓN TÉCNICA"
+    rev = marked["REVISIÓN TÉCNICA"]
+    assert rev["A1"].value == "REVISIÓN TÉCNICA DE AVALÚO — OBSERVACIONES PARA VALIDACIÓN DEL PERITO"
+    assert "(Críticas: 1 | Importantes: 1 | Menores: 1) | Celdas marcadas: 2." in rev["A2"].value
+    assert [rev.cell(5, col).value for col in range(1, 17)] == [
+        "N.º",
+        "Importancia",
+        "Tipo de revisión",
+        "Hoja",
+        "Celda",
+        "Dato revisado",
+        "Hallazgo",
+        "Explicación técnica",
+        "Valor actual",
+        "Valor referencia",
+        "Diferencia",
+        "Corrección recomendada",
+        "Incidencia en valor",
+        "Estado",
+        "Evidencias",
+        "Ubicación",
+    ]
+    assert rev["P6"].hyperlink.location == "'1 DATOS'!C1"
+    assert rev["P8"].hyperlink.location == "'1 DATOS'!D1"
+
+    c1 = marked["1 DATOS"]["C1"]
+    assert c1.value == "=B1*2"
+    assert c1.fill.fgColor.rgb.endswith("FF0000")
+    assert c1.comment is not None
+    for expected in ("Nota original del perito.", "Fórmula con factor duplicado", "Segunda observación consolidada"):
+        assert expected in c1.comment.text
+
+    d1 = marked["1 DATOS"]["D1"]
+    assert d1.fill.fgColor.rgb.endswith("FF0000")
+    assert d1.comment is not None and "Clasificación difiere de escritura" in d1.comment.text
+
+    # Unsafe macro package must be rejected
+    macro_xlsx = tmp_path / "macro.xlsx"
+    with ZipFile(source, "r") as zin, ZipFile(macro_xlsx, "w") as zout:
+        for item in zin.infolist():
+            zout.writestr(item, zin.read(item.filename))
+        zout.writestr("xl/vbaProject.bin", b"fake-macro")
+    with pytest.raises(ValueError, match="componentes activos"):
+        export_marked_excel_openpyxl(macro_xlsx, tmp_path / "fail_macro.xlsx", [f1])
+
+
+def test_cross_platform_env_checker_script():
+    import subprocess
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "check_env.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["os"] in {"windows", "macos", "linux"}
+    keys = {c["key"] for c in payload["checks"]}
+    assert {"python", "python_deps", "node", "frontend_deps", "env", "agent_cli", "pdftoppm", "excel_export"} <= keys
+    py_deps = next(c for c in payload["checks"] if c["key"] == "python_deps")
+    assert py_deps["status"] == "ok", py_deps
+

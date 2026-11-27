@@ -1,6 +1,6 @@
 # Revisión de avalúos
 
-Aplicación local de apoyo a la revisión técnica y documental de avalúos inmobiliarios (cualquier categoría y tamaño). El sistema asiste al perito revisor con agentes conectados por MCP de solo lectura y una segunda etapa de verificación independiente; no sustituye el criterio profesional ni autoriza la entrega bancaria.
+Aplicación local de apoyo a la revisión técnica y documental de avalúos inmobiliarios (cualquier categoría y tamaño), compatible con **macOS, Linux y Windows**. El sistema asiste al perito revisor con agentes conectados por MCP de solo lectura y una segunda etapa de verificación independiente; no sustituye el criterio profesional ni autoriza la entrega bancaria.
 
 ## Arquitectura del flujo
 
@@ -8,40 +8,76 @@ Aplicación local de apoyo a la revisión técnica y documental de avalúos inmo
 2. **Auditoría técnica y contraste documental (Agente 1 + MCP solo lectura):** ejecuta `omp` en un directorio temporal aislado con `--tools=` y acceso exclusivo al servidor MCP `avaluos-lectura` (búsqueda completa en Excel/PDF/DOCX, lectura de rangos, rastreo de precedentes y dependientes, e inspección visual de páginas PDF e imágenes).
 3. **Verificación independiente (Agente 2 en sesión separada):** reabre las fuentes originales mediante MCP para confirmar, matizar o descartar cada candidato antes de generar entregables.
 4. **Entregables profesionales:**
-   - **Excel marcado (`avaluo-marcado.xlsx`):** copia sin alterar fórmulas ni valores originales, con celdas señaladas en rojo, notas visibles consolidadas (conservando notas previas) y hoja `REVISIÓN TÉCNICA` de 16 columnas con enlaces `Ir a la celda`.
+   - **Excel marcado (`avaluo-marcado.xlsx`):** copia sin alterar fórmulas ni valores originales, con celdas señaladas en rojo, notas consolidadas (conservando notas previas) y hoja `REVISIÓN TÉCNICA` de 16 columnas con enlaces `Ir a la celda`. Usa Excel de escritorio (COM) en Windows y el motor multiplataforma `openpyxl` en macOS/Linux (configurable con `AVALUOS_EXCEL_ENGINE`).
    - **Informe Word (`informe-revision.docx`):** resumen ejecutivo, KPIs por severidad y estado, tabla consolidada, detalle técnico con evidencias de ambos extremos, trazabilidad de descartados/explicados y límites de cobertura.
 
-## Ejecución local
+## Comprobación rápida de dependencias (macOS / Linux / Windows)
 
-1. Copia `.env.example` a `.env` en la raíz y ajusta `AVALUOS_STORAGE_ROOT` (ruta absoluta), modelo y límites.
-2. Instala y arranca el backend (PowerShell):
+Un solo comando verifica Python, paquetes declarados en `backend/pyproject.toml`, Node/npm, `frontend/node_modules`, CLI del agente (`omp`), `pdftoppm`, motor Excel y `.env`:
 
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev,documents]"
-.\.venv\Scripts\python.exe -m pytest -v
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --env-file ../.env --host 127.0.0.1 --port 8000
+```bash
+# macOS / Linux
+python3 scripts/check_env.py
+
+# Windows
+python scripts/check_env.py
 ```
 
-3. En otra terminal, arranca el frontend Astro:
+## Instalación y ejecución local
+
+### macOS / Linux
+
+```bash
+cp .env.example .env
+# Edita .env y define una ruta absoluta privada en AVALUOS_STORAGE_ROOT (ej. /Users/tuusuario/avaluos-data)
+brew install poppler  # En macOS (en Ubuntu/Debian: sudo apt install poppler-utils)
+
+python3 -m venv backend/.venv
+backend/.venv/bin/python -m pip install -r requirements.txt
+(cd frontend && npm install)
+python3 scripts/check_env.py
+```
+
+Arranque (en dos terminales):
+
+```bash
+# Terminal 1 (backend)
+cd backend && ./.venv/bin/python -m uvicorn app.main:app --env-file ../.env --host 127.0.0.1 --port 8000
+
+# Terminal 2 (frontend)
+cd frontend && npm run dev
+```
+
+### Windows (PowerShell)
 
 ```powershell
+Copy-Item .env.example .env
+# Edita .env y define una ruta absoluta privada en AVALUOS_STORAGE_ROOT
+
+python -m venv backend\.venv
+.\backend\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm.cmd --prefix frontend install
+python scripts\check_env.py
+```
+
+Arranque (en dos terminales):
+
+```powershell
+# Terminal 1 (backend)
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --env-file ../.env --host 127.0.0.1 --port 8000
+
+# Terminal 2 (frontend)
 cd frontend
-npm.cmd install
 npm.cmd run dev
 ```
 
 Abre `http://127.0.0.1:5174/`.
 
-## Requisitos opcionales recomendados
-
-- **Excel de escritorio en Windows:** necesario para generar la copia `.xlsx` marcada con notas visibles y hoja `REVISIÓN TÉCNICA`.
-- **`pdftoppm` en `PATH`:** habilita la inspección visual multimodal de páginas PDF escaneadas, planos y detección de cortes en el control final PDF.
-
 ## Validación y contratos
 
-- Pruebas backend: `.\.venv\Scripts\python.exe -m pytest -v` (en `backend/`).
-- Compilación frontend: `npm.cmd run build` (en `frontend/`).
-- Esquemas JSON sincronizados: `.\.venv\Scripts\python.exe -m app.schema` (en `backend/`).
+- Diagnóstico multiplataforma: `python3 scripts/check_env.py` (o `--json`).
+- Pruebas backend: `pytest -v` (dentro de `backend/` usando `.venv`).
+- Compilación frontend: `npm run build` (dentro de `frontend/`).
+- Esquemas JSON sincronizados: `python -m app.schema` (dentro de `backend/`).
 - Skills versionadas: [skills/README.md](skills/README.md) · Evaluaciones: [evals/README.md](evals/README.md).

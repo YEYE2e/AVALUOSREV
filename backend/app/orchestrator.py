@@ -585,7 +585,7 @@ async def execute_audit_pipeline(
             )
             downloads["excel"] = f"/api/reviews/{case_id}/{marked_res['report_id']}/xlsx"
         except Exception:
-            excel_warning = "El informe Word está disponible, pero Excel de escritorio no pudo generar la copia marcada."
+            excel_warning = "El informe Word está disponible, pero no se pudo generar la copia marcada de Excel."
 
     severity_counts = {
         "critico": sum(1 for f in active_findings if f.severity == "critico"),

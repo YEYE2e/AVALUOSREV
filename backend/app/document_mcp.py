@@ -6,6 +6,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -14,6 +15,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
+from zipfile import BadZipFile, ZipFile
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -22,7 +24,11 @@ from docx.oxml.ns import nsdecls, qn
 from docx.shared import Inches, Pt, RGBColor
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils.cell import column_index_from_string, range_boundaries
+from openpyxl.worksheet.hyperlink import Hyperlink
 from pydantic import BaseModel, ConfigDict, Field
 from pypdf import PdfReader
 
@@ -36,6 +42,7 @@ from .analyzer import (
     load_case_manifest,
     load_dual_workbook,
     render_pdf_page_png,
+    resolve_excel_target,
     search_docx,
     search_pdf,
     search_workbook,
@@ -122,9 +129,220 @@ def _write_cell_text(cell, text: str, *, bold: bool = False, size: float = 9.0, 
         run.font.color.rgb = RGBColor(*color)
 
 
-def export_marked_excel(source: Path, destination: Path, findings: list[ExcelFinding]) -> None:
-    if os.name != "nt":
-        raise ValueError("La exportación XLSX necesita Excel de escritorio en Windows")
+_UNSAFE_XLSX_PART_RE = re.compile(
+    r"(?i)(vbaProject\.bin|^xl/(connections\.xml|queryTables/|activeX/|embeddings/|macrosheets/))"
+)
+REVIEW_SHEET_NAME = "REVISIÓN TÉCNICA"
+REVIEW_HEADERS = [
+    "N.º",
+    "Importancia",
+    "Tipo de revisión",
+    "Hoja",
+    "Celda",
+    "Dato revisado",
+    "Hallazgo",
+    "Explicación técnica",
+    "Valor actual",
+    "Valor referencia",
+    "Diferencia",
+    "Corrección recomendada",
+    "Incidencia en valor",
+    "Estado",
+    "Evidencias",
+    "Ubicación",
+]
+REVIEW_COL_WIDTHS = {
+    "A": 6,
+    "B": 14,
+    "C": 20,
+    "D": 22,
+    "E": 10,
+    "F": 22,
+    "G": 38,
+    "H": 44,
+    "I": 18,
+    "J": 18,
+    "K": 18,
+    "L": 40,
+    "M": 18,
+    "N": 22,
+    "O": 42,
+    "P": 15,
+}
+
+
+def _validate_safe_xlsx_package(source: Path) -> None:
+    try:
+        with ZipFile(source, "r") as archive:
+            for name in archive.namelist():
+                if _UNSAFE_XLSX_PART_RE.search(name):
+                    raise ValueError("El libro contiene componentes activos que este sistema no abre.")
+    except BadZipFile:
+        raise ValueError("El archivo XLSX no es un paquete válido.") from None
+
+
+def _validate_and_resolve_targets(source: Path, findings: list[ExcelFinding]) -> list[tuple[ExcelFinding, str, str]]:
+    if len(findings) > 100:
+        raise ValueError("Cantidad de hallazgos no válida.")
+    resolved: list[tuple[ExcelFinding, str, str]] = []
+    for item in findings:
+        sheet_name, anchor, err = resolve_excel_target(source, item.sheet, item.cell)
+        if not sheet_name or not anchor:
+            raise ValueError(err or f"El destino '{item.sheet}!{item.cell}' no es visible o está vacío.")
+        resolved.append((item, sheet_name, anchor))
+    return resolved
+
+
+def export_marked_excel_openpyxl(source: Path, destination: Path, findings: list[ExcelFinding]) -> None:
+    """Cross-platform XLSX marking engine (macOS/Linux/fallback): never modifies original values or formulas."""
+    _validate_safe_xlsx_package(source)
+    resolved_targets = _validate_and_resolve_targets(source, findings)
+
+    with TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+        folder = Path(temporary)
+        staged = folder / "original.xlsx"
+        output = folder / "revision.xlsx"
+        shutil.copyfile(source, staged)
+
+        wb = load_workbook(staged, data_only=False, keep_links=False)
+
+        grouped: dict[str, tuple[str, str, list[ExcelFinding]]] = {}
+        resolved_items: list[tuple[str, str, ExcelFinding]] = []
+        for item, sheet_name, anchor in resolved_targets:
+            key = f"{sheet_name.casefold()}!{anchor}"
+            if key not in grouped:
+                grouped[key] = (sheet_name, anchor, [])
+            grouped[key][2].append(item)
+            resolved_items.append((sheet_name, anchor, item))
+
+        red_fill = PatternFill(fill_type="solid", start_color="FFFF0000", end_color="FFFF0000")
+        for sheet_name, anchor, items in grouped.values():
+            ws = wb[sheet_name]
+            cell = ws[anchor]
+            blocks = []
+            for it in items:
+                sev = SEVERITY_LABELS.get(it.severity, it.severity)
+                st = STATUS_LABELS.get(it.status, "REQUIERE VERIFICACIÓN")
+                blocks.append(
+                    f"[{sev.upper()} | {st}] {it.observation}\n"
+                    f"Evidencia: {it.evidence}\n"
+                    f"Recomendación: {it.recommendation}"
+                )
+            note = "\n---\n".join(blocks)
+            if cell.comment and cell.comment.text:
+                note = f"Nota previa:\n{cell.comment.text}\n\n{note}"
+            comment = Comment(note, "Revisión técnica")
+            comment.width = 380
+            comment.height = min(420, 180 + (70 * len(items)))
+            cell.comment = comment
+            cell.fill = red_fill
+
+        existing_lower = {name.casefold() for name in wb.sheetnames}
+        target_sheet_name = REVIEW_SHEET_NAME
+        suffix = 2
+        while target_sheet_name.casefold() in existing_lower:
+            target_sheet_name = f"{REVIEW_SHEET_NAME} ({suffix})"
+            suffix += 1
+
+        report = wb.create_sheet(title=target_sheet_name, index=0)
+        report["A1"] = "REVISIÓN TÉCNICA DE AVALÚO — OBSERVACIONES PARA VALIDACIÓN DEL PERITO"
+        report["A1"].font = Font(bold=True, size=13)
+
+        crit_count = sum(1 for _, _, it in resolved_items if it.severity == "critico")
+        imp_count = sum(1 for _, _, it in resolved_items if it.severity == "importante")
+        men_count = sum(1 for _, _, it in resolved_items if it.severity == "menor")
+        report["A2"] = (
+            f"Observaciones marcadas: {len(resolved_items)} "
+            f"(Críticas: {crit_count} | Importantes: {imp_count} | Menores: {men_count}) | "
+            f"Celdas marcadas: {len(grouped)}."
+        )
+        report["A3"] = (
+            "El libro original no fue modificado ni recalculado. "
+            "Este reporte apoya la revisión profesional y no autoriza la entrega bancaria."
+        )
+        report["A3"].font = Font(italic=True)
+
+        header_fill = PatternFill(fill_type="solid", start_color="FF1E242B", end_color="FF1E242B")
+        header_font = Font(bold=True, color="FFFFFFFF")
+        header_align = Alignment(wrap_text=True, vertical="center")
+        for col_idx, text in enumerate(REVIEW_HEADERS, start=1):
+            hc = report.cell(row=5, column=col_idx, value=text)
+            hc.font = header_font
+            hc.fill = header_fill
+            hc.alignment = header_align
+
+        sev_fills = {
+            "critico": (PatternFill(fill_type="solid", start_color="FFFFD6D6", end_color="FFFFD6D6"), True),
+            "importante": (PatternFill(fill_type="solid", start_color="FFFFECCC", end_color="FFFFECCC"), True),
+            "menor": (PatternFill(fill_type="solid", start_color="FFEBEBEB", end_color="FFEBEBEB"), False),
+        }
+        cell_align = Alignment(wrap_text=True, vertical="top")
+        link_font = Font(color="FF0563C1", underline="single")
+
+        for idx, (sheet_name, anchor, item) in enumerate(resolved_items, start=1):
+            row = 5 + idx
+            values = [
+                str(idx),
+                SEVERITY_LABELS.get(item.severity, item.severity),
+                item.review_type,
+                sheet_name,
+                anchor,
+                item.field_reviewed,
+                item.observation,
+                item.technical_explanation,
+                item.current_value or "",
+                item.expected_value or "",
+                item.difference or "",
+                item.recommendation,
+                IMPACT_LABELS.get(item.value_impact, item.value_impact),
+                STATUS_LABELS.get(item.status, "REQUIERE VERIFICACIÓN"),
+                item.evidence,
+            ]
+            for col_idx, val in enumerate(values, start=1):
+                c = report.cell(row=row, column=col_idx, value=val)
+                c.number_format = "@"
+                c.alignment = cell_align
+
+            sev_cell = report.cell(row=row, column=2)
+            fill, is_bold = sev_fills.get(item.severity, sev_fills["menor"])
+            sev_cell.fill = fill
+            if is_bold:
+                sev_cell.font = Font(bold=True)
+
+            escaped_sheet = sheet_name.replace("'", "''")
+            link_cell = report.cell(row=row, column=16, value="Ir a la celda")
+            link_cell.hyperlink = Hyperlink(
+                ref=f"P{row}",
+                location=f"'{escaped_sheet}'!{anchor}",
+                tooltip="Abrir celda marcada",
+            )
+            link_cell.font = link_font
+            link_cell.alignment = cell_align
+
+        for col_letter, width in REVIEW_COL_WIDTHS.items():
+            report.column_dimensions[col_letter].width = width
+
+        wb.active = 0
+        wb.save(output)
+
+        # Verify output opens cleanly and comments were persisted completely
+        verify_wb = load_workbook(output, data_only=False)
+        for sheet_name, anchor, items in grouped.values():
+            vcell = verify_wb[sheet_name][anchor]
+            comment_text = vcell.comment.text if vcell.comment else ""
+            for it in items:
+                if not (
+                    it.observation in comment_text
+                    and it.evidence in comment_text
+                    and it.recommendation in comment_text
+                ):
+                    raise ValueError(f"No se guardó el comentario completo en {sheet_name}!{anchor}.")
+
+        with output.open("rb") as produced, destination.open("xb") as artifact:
+            shutil.copyfileobj(produced, artifact)
+
+
+def _export_marked_excel_com(source: Path, destination: Path, findings: list[ExcelFinding]) -> None:
     script = Path(__file__).resolve().parents[2] / "scripts" / "revisar-errores-excel.ps1"
     powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     with TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
@@ -184,6 +402,30 @@ def export_marked_excel(source: Path, destination: Path, findings: list[ExcelFin
             ) from None
         with output.open("rb") as produced, destination.open("xb") as artifact:
             shutil.copyfileobj(produced, artifact)
+
+
+def export_marked_excel(source: Path, destination: Path, findings: list[ExcelFinding]) -> str:
+    """Export marked XLSX using Excel COM on Windows (preferred) and openpyxl cross-platform on macOS/Linux."""
+    _validate_safe_xlsx_package(source)
+    _validate_and_resolve_targets(source, findings)
+    engine = os.getenv("AVALUOS_EXCEL_ENGINE", "auto").strip().lower()
+    if engine not in {"auto", "com", "openpyxl"}:
+        engine = "auto"
+
+    if engine == "openpyxl" or os.name != "nt":
+        if engine == "com" and os.name != "nt":
+            raise ValueError("AVALUOS_EXCEL_ENGINE=com solo está disponible en Windows.")
+        export_marked_excel_openpyxl(source, destination, findings)
+        return "openpyxl"
+
+    try:
+        _export_marked_excel_com(source, destination, findings)
+        return "excel_com"
+    except ValueError:
+        if engine == "com":
+            raise
+        export_marked_excel_openpyxl(source, destination, findings)
+        return "openpyxl"
 
 
 def build_professional_word_report(
@@ -432,8 +674,8 @@ def build_server(root: Path, case_id: UUID, *, write_reports: bool = False) -> F
             """Anota hallazgos ya revisados en una copia XLSX. Nunca cambia valores ni fórmulas."""
             source, _ = require(document_id, "xlsx")
             report_id = uuid4()
-            export_marked_excel(source, report_directory() / f"{report_id}.xlsx", hallazgos)
-            return {"report_id": str(report_id), "marked_cells": len(hallazgos)}
+            engine = export_marked_excel(source, report_directory() / f"{report_id}.xlsx", hallazgos)
+            return {"report_id": str(report_id), "marked_cells": len(hallazgos), "engine": engine}
 
         @server.tool()
         def crear_informe(
