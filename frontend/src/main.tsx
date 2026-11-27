@@ -90,6 +90,12 @@ type ReviewResult = {
   model?: string
   category_detected?: string
   summary?: string
+  documentary_verdict?: string
+  documentary_verdict_label?: string
+  conclusion_category?: string
+  conclusion_label?: string
+  conclusion_detail?: string
+  executive_summary?: Record<string, string> | null
   verified_independently?: boolean
   verification_summary?: string
   findings: number
@@ -132,6 +138,22 @@ const IMPACT_LABEL: Record<string, string> = {
   posible: 'Impacto posible',
   ninguno_demostrado: 'Sin impacto demostrado',
   no_determinable: 'Impacto no determinable',
+}
+const EXEC_SUMMARY_LABELS: [string, string][] = [
+  ['errors_by_type', '1. Número y tipo de observaciones'],
+  ['main_inconsistencies', '2. Principales inconsistencias'],
+  ['value_impact_risks', '3. Observaciones que podrían modificar el valor'],
+  ['market_references_to_review', '4. Referencias de mercado a revisar'],
+  ['missing_documentation', '5. Datos que requieren documentación adicional'],
+  ['calculation_errors', '6. Errores de cálculo y fórmula'],
+  ['commercial_and_realization_differences', '7. Diferencias en valor comercial o de realización'],
+  ['banking_review_observations', '8. Observaciones relevantes para revisión bancaria'],
+]
+
+function conclusionTone(category?: string) {
+  if (category === 'no_recomendable_en_estado_actual' || category === 'requiere_correcciones_tecnicas') return 'danger'
+  if (category === 'conforme_para_revision_del_perito' || category === 'conforme_con_correcciones_menores') return 'ok'
+  return 'warn'
 }
 
 function stageIndex(stage: string) {
@@ -408,6 +430,29 @@ export default function App() {
         </div>
 
         {reviewResult.summary && <p className="summary-text">{reviewResult.summary}</p>}
+
+        {(reviewResult.conclusion_label || (reviewResult.mode === 'excel' && reviewResult.documentary_verdict && reviewResult.documentary_verdict !== 'no_aplica')) && (
+          <div className={`verdict-box tone-${conclusionTone(reviewResult.conclusion_category)}`}>
+            {reviewResult.conclusion_label && <p className="verdict-title"><strong>Conclusión:</strong> {reviewResult.conclusion_label}</p>}
+            {reviewResult.mode === 'excel' && reviewResult.documentary_verdict && reviewResult.documentary_verdict !== 'no_aplica' && (
+              <p className="verdict-sub"><strong>Dictamen documental:</strong> {reviewResult.documentary_verdict_label || reviewResult.documentary_verdict}</p>
+            )}
+            {reviewResult.conclusion_detail && <p className="verdict-detail">{reviewResult.conclusion_detail}</p>}
+          </div>
+        )}
+
+        {reviewResult.executive_summary && Object.keys(reviewResult.executive_summary).length > 0 && (
+          <details className="coverage exec-summary">
+            <summary>Resumen ejecutivo detallado (8 ejes)</summary>
+            <dl className="exec-grid">
+              {EXEC_SUMMARY_LABELS.map(([key, label]) => {
+                const val = reviewResult.executive_summary?.[key]
+                return val ? <div key={key}><dt>{label}</dt><dd>{val}</dd></div> : null
+              })}
+            </dl>
+          </details>
+        )}
+
         {reviewResult.verification_summary && <p className="verif-text"><strong>Verificación independiente:</strong> {reviewResult.verification_summary}</p>}
 
         {activeItems.length > 0 && <>

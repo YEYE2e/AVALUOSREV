@@ -6,6 +6,9 @@ from openpyxl import Workbook
 from app.analyzer import (
     index_workbook,
     load_dual_workbook,
+    read_docx_blocks,
+    read_pdf_pages,
+    read_sheet_rows,
     resolve_excel_target,
     search_docx,
     search_workbook,
@@ -89,3 +92,68 @@ def test_docx_search_covers_paragraphs_tables_and_headers(tmp_path: Path):
     assert r1["count"] == 1 and r1["matches"][0]["type"] == "table" and r1["matches"][0]["row"] == 1
     r2 = search_docx(path, "Encabezado Catastro")
     assert r2["count"] == 1 and "header" in r2["matches"][0]["type"]
+
+
+def test_formula_inconsistencies_and_bulk_readers(tmp_path: Path):
+    from pypdf import PdfWriter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Mercado"
+    ws["A1"] = "Ref"
+    ws["B1"] = "Precio"
+    ws["C1"] = "Area"
+    ws["D1"] = "Otro"
+    ws["E1"] = "Unitario"
+    for r in range(2, 7):
+        ws[f"A{r}"] = f"Ref {r - 1}"
+        ws[f"B{r}"] = 100000 + r * 1000
+        ws[f"C{r}"] = 200
+        ws[f"D{r}"] = 100
+        # Row 4 breaks the column formula pattern by dividing by D instead of C
+        ws[f"E{r}"] = f"=B{r}/D{r}" if r == 4 else f"=B{r}/C{r}"
+    ws.row_dimensions[3].hidden = True
+
+    xlsx = tmp_path / "mercado.xlsx"
+    wb.save(xlsx)
+    loaded = load_dual_workbook(xlsx)
+    info = index_workbook(xlsx, loaded=loaded)
+    inconsistencies = info["deterministic_alerts"]["formula_inconsistencies"]
+    assert any(x["cell"] == "E4" and x["formula"] == "=B4/D4" for x in inconsistencies)
+
+    # Bulk row reader skips hidden row 3 and supports pagination
+    page1 = read_sheet_rows(loaded, "Mercado", start_row=1, max_rows=2, max_cells=600)
+    assert [r["row"] for r in page1["rows"]] == [1, 2]
+    assert page1["next_row"] == 4
+    page2 = read_sheet_rows(loaded, "Mercado", start_row=page1["next_row"], max_rows=10, max_cells=600)
+    assert [r["row"] for r in page2["rows"]] == [4, 5, 6]
+    assert page2["next_row"] is None
+
+    # Bulk DOCX reader reads header + paragraphs + full table in one call
+    doc = Document()
+    doc.sections[0].header.paragraphs[0].text = "Certificado Registral"
+    doc.add_paragraph("Propietario: Juan Pérez")
+    t = doc.add_table(rows=2, cols=2)
+    t.cell(0, 0).text = "Predio"
+    t.cell(0, 1).text = "45678"
+    t.cell(1, 0).text = "Gravamen"
+    t.cell(1, 1).text = "Hipoteca abierta"
+    docx_path = tmp_path / "cert.docx"
+    doc.save(docx_path)
+    docx_bulk = read_docx_blocks(docx_path, start_block=1, max_blocks=50)
+    assert any("Certificado Registral" in h["text"] for h in docx_bulk["headers_footers"])
+    assert len(docx_bulk["blocks"]) == 2
+    assert docx_bulk["blocks"][1]["type"] == "table"
+    assert docx_bulk["blocks"][1]["rows"][1]["text"] == "Gravamen | Hipoteca abierta"
+    assert docx_bulk["next_block"] is None
+
+    # Bulk PDF page reader covers multiple pages cleanly
+    pdf_path = tmp_path / "multi.pdf"
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=100, height=100)
+    writer.write(pdf_path)
+    pdf_bulk = read_pdf_pages(pdf_path, start_page=1, end_page=3)
+    assert pdf_bulk["page_count"] == 3
+    assert len(pdf_bulk["pages"]) == 3
+    assert pdf_bulk["next_page"] is None

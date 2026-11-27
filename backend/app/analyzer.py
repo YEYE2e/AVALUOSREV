@@ -262,6 +262,7 @@ def index_workbook(path: Path, loaded: LoadedWorkbook | None = None) -> dict[str
     external_links: list[dict[str, Any]] = []
     hidden_dependencies: list[dict[str, Any]] = []
     formula_breaks: list[dict[str, Any]] = []
+    formula_inconsistencies: list[dict[str, Any]] = []
     total_visible_cells = 0
     total_formulas = 0
 
@@ -367,38 +368,45 @@ def index_workbook(path: Path, loaded: LoadedWorkbook | None = None) -> dict[str
                     })
 
             # Collect section headings (short header rows or uppercase section titles)
-            if first_text_cell and len(headings) < 18:
+            if first_text_cell and len(headings) < 30:
                 coord, txt = first_text_cell
                 if row_non_empty <= 3 or txt.isupper():
                     headings.append({"cell": coord, "text": txt[:80]})
 
-        # Detect formula-break anomalies (hardcoded number surrounded by consistent formulas in same column)
-        if len(formula_breaks) < 30:
-            for c_idx, items in col_series.items():
-                if len(items) < 4:
+        # Detect formula-break anomalies (hardcoded value) and formula pattern outliers in the same column
+        for c_idx, items in col_series.items():
+            if len(items) < 4:
+                continue
+            col_letter = get_column_letter(c_idx)
+            for idx in range(1, len(items) - 1):
+                r_cur, kind_cur, pat_cur, val_cur = items[idx]
+                r_prev, kind_prev, pat_prev, f_prev = items[idx - 1]
+                r_next, kind_next, pat_next, _ = items[idx + 1]
+                if not (
+                    kind_prev == "f"
+                    and kind_next == "f"
+                    and pat_prev == pat_next
+                    and (r_cur - r_prev) <= 2
+                    and (r_next - r_cur) <= 2
+                ):
                     continue
-                col_letter = get_column_letter(c_idx)
-                for idx in range(1, len(items) - 1):
-                    r_cur, kind_cur, _, val_cur = items[idx]
-                    r_prev, kind_prev, pat_prev, f_prev = items[idx - 1]
-                    r_next, kind_next, pat_next, _ = items[idx + 1]
-                    if (
-                        kind_cur == "n"
-                        and kind_prev == "f"
-                        and kind_next == "f"
-                        and pat_prev == pat_next
-                        and (r_cur - r_prev) <= 2
-                        and (r_next - r_cur) <= 2
-                    ):
-                        formula_breaks.append({
-                            "sheet": sname,
-                            "cell": f"{col_letter}{r_cur}",
-                            "hardcoded_value": val_cur,
-                            "neighbor_formula": clip(f_prev, 120),
-                            "context": _row_context_label(val_sheet, r_cur, max_c),
-                        })
-                        if len(formula_breaks) >= 30:
-                            break
+                if kind_cur == "n" and len(formula_breaks) < 40:
+                    formula_breaks.append({
+                        "sheet": sname,
+                        "cell": f"{col_letter}{r_cur}",
+                        "hardcoded_value": val_cur,
+                        "neighbor_formula": clip(f_prev, 120),
+                        "context": _row_context_label(val_sheet, r_cur, max_c),
+                    })
+                elif kind_cur == "f" and pat_cur != pat_prev and len(formula_inconsistencies) < 40:
+                    formula_inconsistencies.append({
+                        "sheet": sname,
+                        "cell": f"{col_letter}{r_cur}",
+                        "formula": clip(val_cur, 150),
+                        "neighbor_formula": clip(f_prev, 150),
+                        "cached_value": clip(val_sheet.cell(row=r_cur, column=c_idx).value, 120),
+                        "context": _row_context_label(val_sheet, r_cur, max_c),
+                    })
 
         used_range = (
             f"{get_column_letter(min_c)}{min_r}:{get_column_letter(max_c)}{max_r}"
@@ -428,7 +436,90 @@ def index_workbook(path: Path, loaded: LoadedWorkbook | None = None) -> dict[str
             "external_links": external_links,
             "hidden_dependencies": hidden_dependencies,
             "formula_breaks": formula_breaks,
+            "formula_inconsistencies": formula_inconsistencies,
         },
+    }
+
+
+def read_sheet_rows(
+    loaded: LoadedWorkbook,
+    sheet_name: str,
+    *,
+    start_row: int = 1,
+    max_rows: int = 80,
+    max_cells: int = 600,
+) -> dict[str, Any]:
+    """Stream populated visible cells row-by-row for complete sheet coverage in 1-3 calls."""
+    if sheet_name not in loaded.sheet_names:
+        raise ValueError("Hoja no encontrada")
+    if sheet_name in loaded.hidden_sheets:
+        raise ValueError("La hoja está oculta")
+
+    sheet = loaded.wb_formulas[sheet_name]
+    val_sheet = loaded.wb_values[sheet_name]
+    h_rows = loaded.hidden_rows[sheet_name]
+    h_cols = loaded.hidden_cols[sheet_name]
+    merges = loaded.merge_map[sheet_name]
+    max_row = sheet.max_row or 0
+    start_row = max(1, start_row)
+    max_rows = max(1, min(max_rows, 150))
+    max_cells = max(50, min(max_cells, 1000))
+
+    rows_out: list[dict[str, Any]] = []
+    cells_returned = 0
+    next_row: int | None = None
+
+    for row in sheet.iter_rows(min_row=start_row, max_row=max_row):
+        if not row:
+            continue
+        r_idx = row[0].row
+        if r_idx in h_rows:
+            continue
+
+        row_cells: list[dict[str, Any]] = []
+        for cell in row:
+            if cell.column in h_cols:
+                continue
+            formula = _extract_formula_text(cell)
+            cached = val_sheet.cell(row=r_idx, column=cell.column).value
+            raw_val = cell.value if not formula else None
+            effective = cached if cached is not None else raw_val
+            if formula is None and (effective is None or str(effective).strip() == ""):
+                continue
+
+            entry: dict[str, Any] = {"cell": cell.coordinate}
+            if formula:
+                entry["f"] = clip(formula, 260)
+                entry["v"] = clip(cached, 260)
+            else:
+                entry["v"] = clip(effective, 260)
+            if cell.number_format and cell.number_format != "General":
+                entry["fmt"] = clip(cell.number_format, 60)
+            anchor = merges.get((r_idx, cell.column))
+            if anchor and anchor != cell.coordinate:
+                entry["merge"] = anchor
+            if cell.comment and cell.comment.text:
+                entry["note"] = clip(cell.comment.text, 200)
+            row_cells.append(entry)
+
+        if not row_cells:
+            continue
+
+        if rows_out and (len(rows_out) >= max_rows or cells_returned + len(row_cells) > max_cells):
+            next_row = r_idx
+            break
+
+        rows_out.append({"row": r_idx, "cells": row_cells})
+        cells_returned += len(row_cells)
+
+    return {
+        "sheet": sheet_name,
+        "start_row": start_row,
+        "max_row": max_row,
+        "rows_returned": len(rows_out),
+        "cells_returned": cells_returned,
+        "next_row": next_row,
+        "rows": rows_out,
     }
 
 
@@ -720,6 +811,126 @@ def search_docx(path: Path, query: str, limit: int = 40) -> dict[str, Any]:
                 if truncated:
                     break
     return {"query": query, "count": len(matches), "truncated": truncated, "matches": matches}
+
+
+def read_pdf_pages(
+    path: Path,
+    *,
+    start_page: int = 1,
+    end_page: int | None = None,
+    max_chars: int = 24000,
+) -> dict[str, Any]:
+    """Read up to 10 consecutive physical PDF pages in a single call."""
+    with path.open("rb") as stream:
+        reader = PdfReader(stream)
+        if reader.is_encrypted:
+            raise ValueError("El PDF está cifrado")
+        total = len(reader.pages)
+        if start_page < 1 or start_page > total:
+            raise ValueError("Página inicial fuera de rango")
+        target_end = min(total, end_page if end_page is not None else start_page + 9)
+        if target_end < start_page:
+            raise ValueError("Rango de páginas inválido")
+        target_end = min(target_end, start_page + 9)
+
+        pages_out: list[dict[str, Any]] = []
+        used_chars = 0
+        next_page: int | None = None
+        for p_num in range(start_page, target_end + 1):
+            text = (reader.pages[p_num - 1].extract_text() or "").strip()
+            searchable = len(text) >= 15
+            if pages_out and used_chars + len(text) > max_chars:
+                next_page = p_num
+                break
+            clipped = text[:max_chars] if len(text) > max_chars else text
+            pages_out.append({
+                "page": p_num,
+                "searchable": searchable,
+                "text": clipped if searchable else "(página escaneada o sin texto extraíble; usar ver_pagina_pdf)",
+                "truncated": len(text) > len(clipped),
+            })
+            used_chars += len(clipped)
+
+        if next_page is None and target_end < total:
+            next_page = target_end + 1
+
+        return {
+            "page_count": total,
+            "start_page": start_page,
+            "end_page": pages_out[-1]["page"] if pages_out else start_page,
+            "next_page": next_page,
+            "pages": pages_out,
+        }
+
+
+def read_docx_blocks(
+    path: Path,
+    *,
+    start_block: int = 1,
+    max_blocks: int = 50,
+    max_chars: int = 24000,
+) -> dict[str, Any]:
+    """Read consecutive DOCX paragraphs and full tables in bulk (plus headers/footers on block 1)."""
+    with path.open("rb") as stream:
+        doc = Document(stream)
+        blocks = list(doc.iter_inner_content())
+        total = len(blocks)
+        if total == 0:
+            return {"block_count": 0, "start_block": 1, "next_block": None, "headers_footers": [], "blocks": []}
+        if start_block < 1 or start_block > total:
+            raise ValueError("Bloque inicial fuera de rango")
+        max_blocks = max(1, min(max_blocks, 80))
+
+        headers_footers: list[dict[str, Any]] = []
+        if start_block == 1:
+            for s_idx, section in enumerate(doc.sections, start=1):
+                for zone, container in (("header", section.header), ("footer", section.footer)):
+                    if not container:
+                        continue
+                    txt = " | ".join(p.text.strip() for p in container.paragraphs if p.text.strip())
+                    if txt:
+                        headers_footers.append({"section": s_idx, "zone": zone, "text": txt[:600]})
+
+        items: list[dict[str, Any]] = []
+        used_chars = 0
+        next_block: int | None = None
+        end_idx = min(total, start_block + max_blocks - 1)
+        for idx in range(start_block, end_idx + 1):
+            block = blocks[idx - 1]
+            if hasattr(block, "rows"):
+                rows_text = []
+                for r_idx, row in enumerate(block.rows, start=1):
+                    line = " | ".join(c.text.strip() for c in row.cells)
+                    if line.strip(" |"):
+                        rows_text.append({"row": r_idx, "text": line[:500]})
+                if not rows_text:
+                    continue
+                size = sum(len(r["text"]) for r in rows_text)
+                if items and used_chars + size > max_chars:
+                    next_block = idx
+                    break
+                items.append({"block": idx, "type": "table", "row_count": len(block.rows), "rows": rows_text[:120]})
+                used_chars += size
+            else:
+                txt = block.text.strip()
+                if not txt:
+                    continue
+                if items and used_chars + len(txt) > max_chars:
+                    next_block = idx
+                    break
+                items.append({"block": idx, "type": "paragraph", "text": txt[:2000]})
+                used_chars += min(len(txt), 2000)
+
+        if next_block is None and end_idx < total:
+            next_block = end_idx + 1
+
+        return {
+            "block_count": total,
+            "start_block": start_block,
+            "next_block": next_block,
+            "headers_footers": headers_footers,
+            "blocks": items,
+        }
 
 
 def build_case_atlas(root: Path, case_id: UUID) -> dict[str, Any]:

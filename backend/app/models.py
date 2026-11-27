@@ -72,6 +72,33 @@ ValueImpact = Literal[
     "ninguno_demostrado",
     "no_determinable",
 ]
+DocumentaryVerdict = Literal[
+    "concuerda",
+    "existen_diferencias",
+    "parcialmente_verificable",
+    "no_verificable_sin_respaldos",
+    "no_aplica",
+]
+ConclusionCategory = Literal[
+    "conforme_para_revision_del_perito",
+    "conforme_con_correcciones_menores",
+    "requiere_correcciones_tecnicas",
+    "requiere_documentacion_o_verificacion",
+    "no_recomendable_en_estado_actual",
+]
+
+
+class ExecutiveSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    errors_by_type: str = Field(default="", max_length=800)
+    main_inconsistencies: str = Field(default="", max_length=1200)
+    value_impact_risks: str = Field(default="", max_length=1000)
+    market_references_to_review: str = Field(default="", max_length=1000)
+    missing_documentation: str = Field(default="", max_length=1000)
+    calculation_errors: str = Field(default="", max_length=1000)
+    commercial_and_realization_differences: str = Field(default="", max_length=1000)
+    banking_review_observations: str = Field(default="", max_length=1200)
 
 
 class StructuredFinding(BaseModel):
@@ -102,8 +129,12 @@ class AgentReviewDraft(BaseModel):
 
     category_detected: str = Field(default="No especificada", max_length=160)
     summary: str = Field(min_length=1, max_length=3000)
-    findings: list[StructuredFinding] = Field(default_factory=list, max_length=100)
-    limitations: list[str] = Field(default_factory=list, max_length=50)
+    documentary_verdict: DocumentaryVerdict = "no_aplica"
+    conclusion_category: ConclusionCategory = "requiere_documentacion_o_verificacion"
+    conclusion_detail: str = Field(default="", max_length=1500)
+    executive_summary: ExecutiveSummary | None = None
+    findings: list[StructuredFinding] = Field(default_factory=list, max_length=150)
+    limitations: list[str] = Field(default_factory=list, max_length=60)
 
 
 class VerifierDecision(BaseModel):
@@ -124,9 +155,9 @@ class VerifierOutput(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
     verification_summary: str = Field(min_length=1, max_length=2000)
-    decisions: list[VerifierDecision] = Field(default_factory=list, max_length=120)
-    additional_findings: list[StructuredFinding] = Field(default_factory=list, max_length=25)
-    additional_limitations: list[str] = Field(default_factory=list, max_length=30)
+    decisions: list[VerifierDecision] = Field(default_factory=list, max_length=160)
+    additional_findings: list[StructuredFinding] = Field(default_factory=list, max_length=40)
+    additional_limitations: list[str] = Field(default_factory=list, max_length=40)
 
 
 class Case(Contract):

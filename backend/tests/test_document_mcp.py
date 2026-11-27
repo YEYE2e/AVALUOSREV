@@ -69,7 +69,19 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
                 await client.initialize()
                 tools = {tool.name for tool in (await client.list_tools()).tools}
                 assert "crear_informe" not in tools
-                assert {"inventario", "resumen_expediente", "buscar_excel", "rastrear_celda_excel", "buscar_pdf", "buscar_docx", "ver_pagina_pdf", "ver_imagen"} <= tools
+                assert {
+                    "inventario",
+                    "resumen_expediente",
+                    "leer_hoja_excel",
+                    "buscar_excel",
+                    "rastrear_celda_excel",
+                    "leer_paginas_pdf",
+                    "buscar_pdf",
+                    "leer_documento_docx",
+                    "buscar_docx",
+                    "ver_pagina_pdf",
+                    "ver_imagen",
+                } <= tools
 
                 async def call(tool, **args):
                     result = await client.call_tool(tool, args)
@@ -87,6 +99,9 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
                 assert [c["cell"] for c in rng["cells"]] == ["B1", "C1"]
                 assert rng["cells"][1]["formula"] == "=A1/B1" and rng["cells"][1]["cached_value"] is None
 
+                sheet_bulk = await call("leer_hoja_excel", document_id=str(xlsx), hoja="Mercado", fila_inicio=1, max_filas=10)
+                assert any(r["row"] == 126 for r in sheet_bulk["rows"])
+
                 # Search far beyond A1:L32
                 found = await call("buscar_excel", document_id=str(xlsx), consulta="Valor proyectado")
                 assert found["count"] == 1 and found["matches"][0]["cell"] == "T126"
@@ -101,11 +116,15 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
 
                 table = await call("leer_bloque_docx", document_id=str(docx), bloque=2, fila=1)
                 assert table["text"] == "300 m2"
+                docx_bulk = await call("leer_documento_docx", document_id=str(docx), bloque_inicio=1, max_bloques=20)
+                assert len(docx_bulk["blocks"]) == 2
                 docx_search = await call("buscar_docx", document_id=str(docx), consulta="300 m2")
                 assert docx_search["count"] == 1
 
                 page = await call("leer_pagina_pdf", document_id=str(pdf), pagina=1)
                 assert not page["searchable_text"]
+                pdf_bulk = await call("leer_paginas_pdf", document_id=str(pdf), pagina_inicio=1, pagina_fin=1)
+                assert pdf_bulk["page_count"] == 1 and len(pdf_bulk["pages"]) == 1
 
         async with stdio_client(parameters("report")) as (read, write):
             async with ClientSession(read, write) as client:
@@ -120,7 +139,7 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
                     "recommendation": "Cotejar el área",
                     "status": "sustentado",
                     "severity": "critico",
-                    "review_type": "Cálculo / fórmula",
+                    "review_type": "Cálculo",
                     "value_impact": "demostrado",
                 }
                 denied = await client.call_tool("marcar_excel", {"document_id": str(xlsx), "hallazgos": [{**finding, "cell": "A1"}]})
@@ -134,6 +153,13 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
                         "hallazgos": [{k: v for k, v in finding.items() if k not in ("sheet", "cell")}],
                         "resumen": "Resumen técnico",
                         "verified_independently": True,
+                        "documentary_verdict": "existen_diferencias",
+                        "conclusion_category": "requiere_correcciones_tecnicas",
+                        "conclusion_detail": "Corregir fórmula de precio unitario antes de entrega.",
+                        "executive_summary": {
+                            "errors_by_type": "1 error crítico de cálculo.",
+                            "calculation_errors": "Mercado!C1 usa divisor incorrecto.",
+                        },
                     },
                 )
                 assert not result.isError, result.content
@@ -157,13 +183,24 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
             assert any(
                 node.findtext("{*}Row") == "0"
                 and node.findtext("{*}Column") == "2"
-                and node.find("{*}Visible") is not None
+                and node.findtext("{*}Visible") is not None
                 for part in archive.namelist()
                 if part.endswith(".vml")
                 for node in ElementTree.fromstring(archive.read(part)).iterfind(".//{*}ClientData")
             )
     assert any(
-        message and all(text in message for text in ("Nota original del revisor.", "Revisar área", "Mercado!B1", "Cotejar el área"))
+        message
+        and all(
+            text in message
+            for text in (
+                "Nota original del revisor.",
+                "ERROR DE CÁLCULO [CRÍTICO | SUSTENTADO]:",
+                "Revisar área",
+                "Mercado!B1",
+                "Cotejar el área",
+                "Incidencia en el valor: Demostrado",
+            )
+        )
         for message in comments
     )
     assert marked.active.title == "REVISIÓN TÉCNICA"
@@ -191,7 +228,11 @@ def test_case_scoped_stdio_readers_and_separate_writer(tmp_path):
     assert review_sheet["P6"].hyperlink.location == "'Mercado'!C1"
     assert review_sheet["G6"].value == "Revisar área"
     report = Document(tmp_path / str(case) / "reports" / f"{report_id}.docx")
-    assert any("Revisar área" in p.text for p in report.paragraphs)
+    all_para = "\n".join(p.text for p in report.paragraphs)
+    assert "Revisar área" in all_para
+    assert "CONCLUSIÓN DE LA REVISIÓN" in all_para
+    assert "1 error crítico de cálculo." in all_para
+    assert "REQUIERE CORRECCIONES TÉCNICAS ANTES DE SU ENTREGA" in all_para
     assert original.read_bytes() == excel_file.read_bytes()
 
 

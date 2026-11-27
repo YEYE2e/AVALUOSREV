@@ -40,7 +40,7 @@ try {
         if (!$Salida -or (Test-Path -LiteralPath $Salida)) { throw 'La salida debe ser un archivo nuevo.' }
         $findings = Get-Content -LiteralPath $Hallazgos -Raw -Encoding UTF8 | ConvertFrom-Json
         $findings = @($findings)
-        if ($findings.Count -gt 100) { throw 'Cantidad de hallazgos no valida.' }
+        if ($findings.Count -gt 150) { throw 'Cantidad de hallazgos no valida.' }
         foreach ($item in $findings) {
             if ($item.Cell -cnotmatch '^[A-Z]{1,3}[1-9][0-9]{0,6}$') { throw 'Referencia de celda no valida.' }
         }
@@ -69,7 +69,7 @@ try {
                     Evidence = "$($sheet.name)!$address = $errorCode"; Status = 'REQUIERE VERIFICACION';
                     Severity = 'Importante'; ReviewType = "C$($acA)lculo / f$($acO)rmula"; FieldReviewed = '';
                     TechnicalExplanation = ''; CurrentValue = $errorCode; ExpectedValue = '';
-                    Difference = ''; ValueImpact = 'No determinable'
+                    Difference = ''; ValueImpact = 'No determinable'; NotePrefix = 'REQUIERE VERIFICACION'
                 }
             }
         }
@@ -142,11 +142,13 @@ try {
         foreach ($it in $entry.Items) {
             $sev = Safe-Prop $it 'Severity' 'Importante'
             $st = Safe-Prop $it 'Status' 'REQUIERE VERIFICACION'
+            $prefix = Safe-Prop $it 'NotePrefix' "REVISI$($acCapO)N"
             $err = Safe-Prop $it 'Error' ''
             $ev = Safe-Prop $it 'Evidence' ''
             $rec = Safe-Prop $it 'Recommendation' ''
+            $impact = Safe-Prop $it 'ValueImpact' 'No determinable'
             if ($Hallazgos) {
-                $blocks += "[$($sev.ToUpperInvariant()) | $st] $err`nEvidencia: $ev`nRecomendaci$($acO)n: $rec"
+                $blocks += "$prefix [$($sev.ToUpperInvariant()) | $st]: $err`nEvidencia: $ev`nRecomendaci$($acO)n: $rec`nIncidencia en el valor: $impact"
             } else {
                 $blocks += "REQUIERE VERIFICACION: $err guardado. $rec Incidencia en el valor no determinada."
             }
@@ -166,8 +168,8 @@ try {
                 $written = $cell.AddCommentThreaded($note)
             } catch [Runtime.InteropServices.COMException] {
                 $written = $cell.AddComment($note)
-                $written.Shape.Width = 380
-                $written.Shape.Height = [Math]::Min(420, 180 + (70 * $entry.Items.Count))
+                $written.Shape.Width = 400
+                $written.Shape.Height = [Math]::Min(460, 200 + (80 * $entry.Items.Count))
                 $written.Visible = $true
             }
             if (!$written) { throw 'No se guardo la explicacion del hallazgo.' }

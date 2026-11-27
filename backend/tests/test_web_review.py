@@ -150,6 +150,10 @@ def test_multi_stage_excel_pipeline_with_independent_verifier_and_history(tmp_pa
     # Merged cell V126 must have been resolved deterministically to anchor U126!
     assert body["items"][0]["cell"] == "U126"
     assert body["items"][0]["status"] == "sustentado"
+    # Deterministic safety guards: 0 supports -> no_verificable_sin_respaldos; critical sustentado -> requiere_correcciones_tecnicas
+    assert body["documentary_verdict"] == "no_verificable_sin_respaldos"
+    assert body["conclusion_category"] in ("requiere_correcciones_tecnicas", "requiere_documentacion_o_verificacion")
+    assert body["conclusion_label"]
 
     # Downloads work
     word_resp = client.get(body["downloads"]["word"])
@@ -168,3 +172,58 @@ def test_multi_stage_excel_pipeline_with_independent_verifier_and_history(tmp_pa
     # Original file remained strictly untouched
     originals = list(tmp_path.glob("*/originals/*"))
     assert len(originals) == 1 and originals[0].read_bytes() == excel_bytes
+
+
+def test_deterministic_verdict_and_conclusion_safety_guards():
+    from app.models import AgentReviewDraft, StructuredFinding
+
+    crit_doc = StructuredFinding(
+        id="H-01",
+        severity="critico",
+        review_type="Documental",
+        location="Datos!B4",
+        sheet="Datos",
+        cell="B4",
+        observation="Área difiere de escritura.",
+        evidence="Datos!B4 vs Escritura pág. 3",
+        recommendation="Ajustar área.",
+        value_impact="demostrado",
+        status="sustentado",
+    )
+    optimistic_draft = AgentReviewDraft(
+        summary="Borrador optimista",
+        documentary_verdict="concuerda",
+        conclusion_category="conforme_para_revision_del_perito",
+        findings=[crit_doc],
+    )
+
+    # With supports and a documentary discrepancy: cannot say concuerda or conforme
+    doc_v, concl = orchestrator._resolve_verdicts(
+        mode="excel",
+        supports_count=2,
+        draft=optimistic_draft,
+        active_findings=[crit_doc],
+        verified_ok=True,
+    )
+    assert doc_v == "existen_diferencias"
+    assert concl == "requiere_correcciones_tecnicas"
+
+    # Without supports in Excel: must say no_verificable_sin_respaldos
+    doc_v2, _ = orchestrator._resolve_verdicts(
+        mode="excel",
+        supports_count=0,
+        draft=optimistic_draft,
+        active_findings=[crit_doc],
+        verified_ok=True,
+    )
+    assert doc_v2 == "no_verificable_sin_respaldos"
+
+    # In PDF mode: documentary verdict must always be no_aplica
+    doc_v3, _ = orchestrator._resolve_verdicts(
+        mode="pdf",
+        supports_count=0,
+        draft=optimistic_draft,
+        active_findings=[],
+        verified_ok=False,
+    )
+    assert doc_v3 == "no_aplica"
